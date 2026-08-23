@@ -19,7 +19,7 @@
 
 1. Открой https://github.com/new
 2. **Repository name:** `OrionSplit`
-3. **Description:** `Удаление диалогов из аудио и видео. Mel-Band RoFormer, GPU, портативная сборка под Windows.`
+3. **Description:** `Удаление диалогов из аудио. Mel-Band RoFormer, GPU, портативная сборка под Windows.`
 4. Выбери **Public**
 5. Ничего не отмечай в «Initialize this repository» — файлы зальём сами
 6. Нажми **Create repository**
