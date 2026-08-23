@@ -1,0 +1,21 @@
+# сборки
+build/
+dist/
+*.spec
+
+# окружение
+.venv/
+__pycache__/
+*.pyc
+
+# крупные бинарники — их место в релизах, а не в репозитории
+assets/bin/*.exe
+models/
+_model_src/
+_models_tmp/
+_unused/
+
+# служебное
+*.rar
+*.zip
+_shot*.png

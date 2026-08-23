@@ -1,0 +1,10 @@
+PySide6>=6.6
+torch>=2.1
+safetensors>=0.4
+einops>=0.7
+rotary-embedding-torch>=0.5
+beartype>=0.17
+librosa>=0.10
+soundfile>=0.12
+PyYAML>=6.0
+numpy
