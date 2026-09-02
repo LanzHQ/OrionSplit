@@ -95,17 +95,11 @@ class TrackDialog(QDialog):
         self.rb_mix = QRadioButton("Одним файлом (как есть)")
         self.rb_split = QRadioButton("Разбить по каналам — отдельный файл "
                                      "на каждый")
-        self.rb_mix.setChecked(True)
         self.grp.addButton(self.rb_mix, 0)
         self.grp.addButton(self.rb_split, 1)
         self.rb_split.toggled.connect(self._sync)
         bl.addWidget(self.rb_mix)
         bl.addWidget(self.rb_split)
-
-        self.cb_merge = QCheckBox("После обработки собрать обратно "
-                                  "в один многоканальный файл")
-        self.cb_merge.setChecked(True)
-        bl.addWidget(self.cb_merge)
 
         self.hint = QLabel("")
         self.hint.setObjectName("fileMeta")
@@ -119,6 +113,10 @@ class TrackDialog(QDialog):
 
         lay.addLayout(_buttons("ДОБАВИТЬ", self.accept, self.reject))
 
+        # умолчание — разбивка по каналам; для стерео _sync() вернёт
+        # «одним файлом». Ставим после сборки виджетов: toggled дёргает
+        # _sync(), а тому нужна уже созданная подсказка.
+        self.rb_split.setChecked(True)
         self._sync()
 
     def _sync(self):
@@ -128,7 +126,6 @@ class TrackDialog(QDialog):
         names = media.channel_names(ch)
         multi = ch >= MULTICHANNEL_FROM
         self.rb_split.setEnabled(multi)
-        self.cb_merge.setEnabled(multi and self.rb_split.isChecked())
         if not multi:
             self.rb_mix.setChecked(True)
             self.hint.setText(
@@ -138,9 +135,8 @@ class TrackDialog(QDialog):
             self.hint.setText(
                 f"{t['layout']} — каналы: {', '.join(names)}. "
                 f"При разбивке получится {ch} отдельных файлов "
-                "(диалоги обычно в центральном канале C). Лишние каналы "
-                "можно убрать из списка — при сборке они возьмутся "
-                "из исходника нетронутыми.")
+                "(диалоги обычно в центральном канале C). «Одним файлом» "
+                "— тот же результат, но одной многоканальной дорожкой.")
 
     def result_choice(self):
         t = self.tracks[self.cmb.currentIndex()]
@@ -149,7 +145,6 @@ class TrackDialog(QDialog):
                     layout=t["layout"],
                     split=self.rb_split.isChecked()
                     and self.rb_split.isEnabled(),
-                    merge=self.cb_merge.isChecked(),
                     apply_all=self.cb_all.isChecked())
 
 

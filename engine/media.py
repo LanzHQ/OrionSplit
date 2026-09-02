@@ -164,6 +164,9 @@ def extract(src, dst, audio_index=0, channel=None, sample_rate=None,
     return dst
 
 
+# Из интерфейса больше не вызывается: многоканальный вход теперь
+# обрабатывается поканально прямо в движке и сразу пишется одним
+# файлом. Оставлено как готовый инструмент сборки каналов.
 def merge_channels(dst, parts, layout=None, original=None, audio_index=0,
                    sample_rate=None, log=None):
     """Собирает многоканальный файл из отдельных каналов.

@@ -190,10 +190,23 @@ class Separator:
             except Exception:
                 # чекпоинт не покрывает все веса — обычный путь
                 meta_ok = False
-                self.model = MelBandRoformer(**model_args)
+                self.model = build()
 
         if not meta_ok:
-            self.model.load_state_dict(state)
+            try:
+                self.model.load_state_dict(state)
+            except RuntimeError as e:
+                # Почти всегда это модель, спаренная с чужим конфигом:
+                # архитектуру задаёт именно yaml, и веса в чужой каркас
+                # не лягут — Qt показывает невнятный список missing keys.
+                raise RuntimeError(f"""Веса модели не подходят к её конфигу.
+  модель: {os.path.basename(ckpt_path)}
+  конфиг: {os.path.basename(config_path)} (архитектура {self.arch})
+Скорее всего в папке models лежит .yaml от другой модели и подхватился
+он. Оставь там только конфиг нужной модели либо назови его так же, как
+файл весов.
+
+Исходная ошибка: {e}""") from None
             self.model.to(self.device)
 
         self.model.eval()
@@ -480,11 +493,23 @@ class Separator:
         try:
             with sf.SoundFile(path) as fin:
                 total = len(fin)
+                n_in = fin.channels
+                # Модель принимает строго 1 или 2 канала. Многоканальную
+                # дорожку (5.1 и подобные) гоняем поканально и собираем
+                # результат обратно в такую же раскладку.
+                multi = n_in > 2
+                n_out = n_in if multi else 2
                 self.log(f"Длительность: {total / self.sample_rate / 60:.1f}"
-                         f" мин, обрабатываю...")
+                         f" мин, каналов: {n_in}"
+                         + (" — обрабатываю поканально" if multi else "")
+                         + ", обрабатываю...")
 
                 margin = int(self.config.audio["chunk_size"])
-                limit = int(self.BLOCK_SECONDS * self.sample_rate)
+                secs = self.BLOCK_SECONDS
+                if multi:
+                    # на каждый канал свой буфер — блок соразмерно короче
+                    secs = max(120, int(secs * 2 / n_in))
+                limit = int(secs * self.sample_rate)
                 step = max(limit - 2 * margin, margin)
 
                 want = []
@@ -496,9 +521,10 @@ class Separator:
                     dst = self._pick_name(out_dir, base, suffix, ext)
                     writers[is_voc] = sf.SoundFile(
                         dst, "w", samplerate=self.sample_rate,
-                        channels=2, subtype=subtype)
+                        channels=n_out, subtype=subtype)
                     saved.append(dst)
 
+                passes = n_in if multi else 1      # прогонов на блок
                 pos = 0
                 while pos < total:
                     if should_stop and should_stop():
@@ -508,25 +534,53 @@ class Separator:
                     fin.seek(lo)
                     block = fin.read(hi - lo, dtype="float32",
                                      always_2d=True).T
-                    if block.shape[0] == 1:              # моно → стерео
-                        block = np.vstack([block, block])
-                    block = np.ascontiguousarray(block, dtype=np.float32)
-
-                    res = self._demix_block(
-                        block,
-                        progress=lambda d, t, _lo=lo: progress(
-                            min(_lo + d, total), total) if progress else None,
-                        should_stop=should_stop)
-                    voc, inst = self.to_two_stems(res, block)
-
                     a = pos - lo
                     b = a + min(step, total - pos)
-                    for is_voc, w in writers.items():
-                        part = voc if is_voc else inst
-                        if part is not None:
-                            w.write(part[..., a:b].T)
+
+                    def report(done, _lo=lo, _k=0):
+                        if progress:
+                            unit = total * passes
+                            progress(min(_k * total + _lo + done, unit), unit)
+
+                    if not multi:
+                        pair = block
+                        if pair.shape[0] == 1:          # моно → стерео
+                            pair = np.vstack([pair, pair])
+                        pair = np.ascontiguousarray(pair, dtype=np.float32)
+                        res = self._demix_block(
+                            pair, progress=lambda d, t: report(d),
+                            should_stop=should_stop)
+                        voc, inst = self.to_two_stems(res, pair)
+                        for is_voc, w in writers.items():
+                            part = voc if is_voc else inst
+                            if part is not None:
+                                w.write(part[..., a:b].T)
+                    else:
+                        seg = b - a
+                        outs = {k: np.zeros((n_out, seg), dtype=np.float32)
+                                for k in writers}
+                        for ch in range(n_in):
+                            if should_stop and should_stop():
+                                raise RenderCancelled()
+                            mono = block[ch]
+                            pair = np.ascontiguousarray(
+                                np.vstack([mono, mono]), dtype=np.float32)
+                            res = self._demix_block(
+                                pair,
+                                progress=lambda d, t, _k=ch: report(d, _k=_k),
+                                should_stop=should_stop)
+                            voc, inst = self.to_two_stems(res, pair)
+                            for is_voc in outs:
+                                part = voc if is_voc else inst
+                                if part is not None:
+                                    # канал был моно — берём одну сторону
+                                    outs[is_voc][ch] = part[0, a:b]
+                            res = voc = inst = pair = None
+                        for is_voc, w in writers.items():
+                            w.write(outs[is_voc].T)
+                        outs = None
                     pos += step
-                    res = voc = inst = block = None       # освобождаем сразу
+                    block = None                    # освобождаем сразу
 
             for w in writers.values():
                 w.close()

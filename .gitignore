@@ -1,6 +1,8 @@
 # сборки
 build/
 dist/
+dist_v*/
+.models_keep/
 *.spec
 
 # окружение

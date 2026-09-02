@@ -4,6 +4,7 @@ OrionSplit — удаление диалогов из аудио и видео.
 Автор: Ilya Lavrin.
 """
 import json
+import io
 import os
 import sys
 import tempfile
@@ -28,7 +29,7 @@ from ui.dialogs import TrackDialog, SettingsDialog
 
 APP_NAME = "OrionSplit"
 APP_ID = "OrionSplit"
-APP_VERSION = "v3.1"
+APP_VERSION = "v3.2"
 AUTHOR = "Ilya Lavrin"
 
 AUDIO_EXT = (".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus",
@@ -48,6 +49,32 @@ def resource_path(rel):
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, rel)
+
+
+def _yaml_arch(path):
+    """Какая архитектура описана в конфиге. Файлы маленькие, читаем целиком."""
+    try:
+        with io.open(path, encoding="utf-8", errors="ignore") as f:
+            txt = f.read()
+    except OSError:
+        return None
+    for line in txt.splitlines():
+        low = line.strip().lower()
+        if low.startswith("cls:") and "bandit" in low:
+            return "bandit_v2"
+        if low.startswith("kwargs:"):
+            return "bandit_v2"
+    return "mel_band_roformer"
+
+
+def _name_arch(filename):
+    """Подсказка об архитектуре по имени файла модели (или None)."""
+    low = filename.lower()
+    if "bandit" in low:
+        return "bandit_v2"
+    if "roformer" in low or "melband" in low or "mel_band" in low:
+        return "mel_band_roformer"
+    return None
 
 
 def find_models():
@@ -75,22 +102,39 @@ def find_models():
         # 3) если конфиг остался один на одну модель — берём его.
         # Без этого вторая модель в папке отбирала конфиг у первой.
         pairs, free_y = {}, list(yamls)
+        # Один конфиг обслуживает все одноимённые файлы весов: рядом
+        # обычно лежат и .ckpt, и сконвертированный .safetensors. Если
+        # отдавать yaml только первому по алфавиту, .safetensors остаётся
+        # без пары и не показывается вовсе.
+        used = set()
         for f in models:
             stem = os.path.splitext(f)[0].lower()
-            y = next((x for x in free_y
+            y = next((x for x in yamls
                       if os.path.splitext(x)[0].lower() == stem), None)
             if y:
                 pairs[f] = y
-                free_y.remove(y)
+                used.add(y)
+        free_y = [y for y in free_y if y not in used]
+        # У штатной пары имена не совпадают вовсе
+        # (melband_roformer_..._v2 + config_melbandroformer_...), поэтому
+        # правило «остался один конфиг» нужно. Но брать конфиг ЧУЖОЙ
+        # архитектуры нельзя: веса Mel-Band в каркасе Bandit дают
+        # невнятный «Missing key(s) in state_dict». Поэтому сначала
+        # отсеиваем конфиги, противоречащие имени модели.
         for f in models:
             if f in pairs or not free_y:
                 continue
             stem = os.path.splitext(f)[0].lower()
-            best = max(free_y, key=lambda x: len(os.path.commonprefix(
+            want = _name_arch(f)
+            fit = [y for y in free_y
+                   if want is None or _yaml_arch(os.path.join(d, y)) == want]
+            if not fit:
+                continue
+            best = max(fit, key=lambda x: len(os.path.commonprefix(
                 [stem, os.path.splitext(x)[0].lower()])))
             score = len(os.path.commonprefix(
                 [stem, os.path.splitext(best)[0].lower()]))
-            if score >= 4 or len(free_y) == 1:
+            if score >= 4 or len(fit) == 1:
                 pairs[f] = best
                 free_y.remove(best)
 
@@ -196,10 +240,6 @@ class Job:
         self.meta = ""
         self.saved = []            # что получилось на выходе
 
-        # сборка каналов обратно в один файл
-        self.merge_key = None      # общий ключ для каналов одной дорожки
-        self.merge_base = ""       # имя итогового файла
-        self.merge_dir = ""        # куда его класть
         self.ch_count = 0          # всего каналов в дорожке
         self.layout = ""
 
@@ -367,74 +407,7 @@ class RenderWorker(QThread):
                     except OSError:
                         pass
 
-        if not cancelled:
-            merged_dir = self._merge_channels()
-            out_dir = merged_dir or out_dir
-
         self.finished_all.emit(ok, len(self.jobs), out_dir, cancelled)
-
-    # ----- сборка каналов обратно -----
-    def _merge_channels(self):
-        """Склеивает обработанные каналы в один многоканальный файл.
-
-        Каналы, которые в обработку не попали (например LFE убрали из
-        списка), берутся из исходника — для инструментала это то, что
-        нужно. Для голоса такие каналы заполняются тишиной: голос из
-        них не выделяли.
-        """
-        groups = {}
-        for job in self.jobs:
-            if job.merge_key and job.saved:
-                groups.setdefault(job.merge_key, []).append(job)
-        if not groups:
-            return ""
-
-        last_dir = ""
-        for key, jobs in groups.items():
-            head = jobs[0]
-            done = {}                       # канал -> {стем: файл}
-            for j in jobs:
-                for p in j.saved:
-                    stem = ("vocals" if "_vocals" in os.path.basename(p)
-                            else "instrumental")
-                    done.setdefault(j.channel, {})[stem] = p
-            stems = sorted({s for v in done.values() for s in v})
-            ext = os.path.splitext(head.saved[0])[1]
-
-            for stem in stems:
-                parts = []
-                for ch in range(head.ch_count):
-                    path = done.get(ch, {}).get(stem)
-                    if path:
-                        parts.append(("file", path))
-                    elif stem == "instrumental":
-                        parts.append(("orig", ch))   # не трогали — как было
-                    else:
-                        parts.append(("mute", ch))   # голос отсюда не брали
-                if not any(p[0] == "file" for p in parts):
-                    continue
-                dst = os.path.join(head.merge_dir,
-                                   f"{head.merge_base}_{stem}{ext}")
-                n = 1
-                while os.path.exists(dst):
-                    dst = os.path.join(
-                        head.merge_dir,
-                        f"{head.merge_base}_{stem}_{n}{ext}")
-                    n += 1
-                skipped = head.ch_count - len(
-                    [p for p in parts if p[0] == "file"])
-                try:
-                    media.merge_channels(
-                        dst, parts, layout=head.layout, original=head.src,
-                        audio_index=head.audio_index,
-                        log=lambda m: self.log.emit(m, "normal"))
-                    note = (f" (из них {skipped} взято из исходника)"
-                            if skipped and stem == "instrumental" else "")
-                    self.log.emit(f"Собрано: {dst}{note}", "ok")
-                    last_dir = os.path.dirname(dst)
-                except Exception as e:
-                    self.log.emit(f"Не удалось собрать каналы: {e}", "error")
-        return last_dir
 
 
 # ---------------- главное окно ----------------
@@ -970,19 +943,14 @@ class MainWindow(QMainWindow):
             names = media.channel_names(t["channels"])
             root = self._out_root(path)
             out_dir = os.path.join(root, base + "_channels")
-            merge = bool(choice.get("merge", True))
             jobs = []
             for ci, cname in enumerate(names):
                 j = Job(path, base=f"{base}_{cname}", audio_index=idx,
                         channel=ci, channel_name=cname, out_dir=out_dir,
                         extract=True)
                 j.meta = self._track_meta(t, path, channel=cname)
-                if merge:
-                    j.merge_key = f"{os.path.normcase(path)}|{idx}"
-                    j.merge_base = base
-                    j.merge_dir = root
-                    j.ch_count = t["channels"]
-                    j.layout = t["layout"]
+                j.ch_count = t["channels"]
+                j.layout = t["layout"]
                 jobs.append(j)
             return jobs
 
