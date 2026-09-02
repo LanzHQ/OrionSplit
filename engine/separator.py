@@ -197,7 +197,51 @@ class Separator:
             self.model.to(self.device)
 
         self.model.eval()
-        self.log("Движок готов.")
+        self.BLOCK_SECONDS = self._auto_block_seconds()
+        self.log(f"Движок готов (блок {self.BLOCK_SECONDS // 60} мин "
+                 f"{self.BLOCK_SECONDS % 60:02d} с).")
+
+    def _auto_block_seconds(self):
+        """Размер блока под свободную память.
+
+        Буферы накопления занимают 32 байта на отсчёт (два массива
+        стемы x каналы x отсчёты в fp32). Берём под них четверть
+        свободной видеопамяти: на слабой карте блок станет короче,
+        на сильной — длиннее. Меньше блок — больше накладных на поля
+        перекрытия, поэтому ограничиваем снизу.
+        """
+        budget = None
+        if self.device.type == "cuda":
+            try:
+                free, _ = torch.cuda.mem_get_info()
+                budget = free * 0.25
+            except Exception:
+                budget = None
+        if budget is None:                      # CPU: пляшем от ОЗУ
+            try:
+                import ctypes
+                class _MS(ctypes.Structure):
+                    _fields_ = [("dwLength", ctypes.c_ulong),
+                                ("dwMemoryLoad", ctypes.c_ulong),
+                                ("ullTotalPhys", ctypes.c_ulonglong),
+                                ("ullAvailPhys", ctypes.c_ulonglong),
+                                ("ullTotalPageFile", ctypes.c_ulonglong),
+                                ("ullAvailPageFile", ctypes.c_ulonglong),
+                                ("ullTotalVirtual", ctypes.c_ulonglong),
+                                ("ullAvailVirtual", ctypes.c_ulonglong),
+                                ("ullAvailExtendedVirtual",
+                                 ctypes.c_ulonglong)]
+                st = _MS()
+                st.dwLength = ctypes.sizeof(st)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+                budget = st.ullAvailPhys * 0.15
+            except Exception:
+                budget = 1 << 30
+
+        per_sample = 32 * max(len(self.instruments), 2) / 2
+        secs = budget / per_sample / max(self.sample_rate, 1)
+        secs = int(max(120, min(480, secs)))     # от 2 до 8 минут
+        return secs
 
     def set_overlap(self, num_overlap):
         """Сменить overlap без перезагрузки модели (Качество/Быстро)."""
@@ -213,10 +257,51 @@ class Separator:
         self.demix(silence)
 
     # ---------------- demix (порт generic-режима ZFTurbo) ----------------
+    # Длинные файлы обрабатываем блоками: буферы result/counter растут
+    # линейно с длительностью, и на двухчасовом фильме это ~4.6 ГБ каждый.
+    # Блок в 8 минут держит их в пределах ~350 МБ.
+    BLOCK_SECONDS = 8 * 60
+
     @torch.inference_mode()
     def demix(self, mix_np, progress=None, should_stop=None):
-        """mix_np: float32 ndarray (channels, time) → dict stem->ndarray.
-        should_stop: колбэк; вернёт True → RenderCancelled."""
+        """mix_np: float32 ndarray (channels, time) → dict stem->ndarray."""
+        total = mix_np.shape[-1]
+        limit = int(self.BLOCK_SECONDS * self.sample_rate)
+        if total <= limit:
+            return self._demix_block(mix_np, progress, should_stop)
+
+        # Поля перекрытия отбрасываем: внутри них края блока обработаны
+        # не полностью. Ширина в один чанк гарантирует, что каждый
+        # оставленный отсчёт покрыт всеми окнами, как при сплошном проходе.
+        margin = int(self.config.audio["chunk_size"])
+        step = max(limit - 2 * margin, margin)
+        self.log(f"Файл длинный — обрабатываю блоками по "
+                 f"{self.BLOCK_SECONDS // 60} мин")
+
+        parts, pos = [], 0
+        while pos < total:
+            lo = max(0, pos - margin)
+            hi = min(total, pos + step + margin)
+            block = mix_np[..., lo:hi]
+
+            base = pos
+            def block_progress(done, tot, _base=base, _lo=lo):
+                if progress:
+                    progress(min(_lo + done, total), total)
+
+            res = self._demix_block(block, block_progress, should_stop)
+            # отрезаем перекрытие, оставляя ровно участок [pos, pos+step)
+            a = pos - lo
+            b = a + min(step, total - pos)
+            parts.append({k: v[..., a:b] for k, v in res.items()})
+            pos += step
+
+        return {k: np.concatenate([p[k] for p in parts], axis=-1)
+                for k in parts[0]}
+
+    @torch.inference_mode()
+    def _demix_block(self, mix_np, progress=None, should_stop=None):
+        """Обработка одного блока. should_stop вернёт True → RenderCancelled."""
         cfg = self.config
         chunk_size = int(cfg.audio["chunk_size"])
         num_overlap = int(cfg.inference["num_overlap"])
@@ -232,8 +317,11 @@ class Separator:
 
         if length_init > 2 * border and border > 0:
             mix = nn.functional.pad(mix, (border, border), mode="reflect")
-        if on_cuda:
-            mix = mix.pin_memory()  # быстрые non_blocking-копии на GPU
+        # закрепление ускоряет копии на GPU, но такая память
+        # не выгружается — на больших массивах это само по себе
+        # становится проблемой
+        if on_cuda and mix.numel() * 4 < (512 << 20):
+            mix = mix.pin_memory()
 
         use_amp = bool((cfg.get("training", {}) or {}).get("use_amp", True))
         autocast_ctx = (torch.autocast(device_type="cuda", enabled=use_amp)
@@ -341,40 +429,132 @@ class Separator:
         else:
             sf.write(path, data, self.sample_rate, subtype="FLOAT")
 
+    _SUBTYPE = {"flac24": "PCM_24", "wav24": "PCM_24", "wav32": "FLOAT"}
+
+    def _ensure_rate(self, src):
+        """Даёт файл с частотой модели. При несовпадении пересчитывает
+        его через ffmpeg во временный — это дешевле по памяти, чем
+        ресемплировать весь массив в питоне."""
+        import soundfile as sf
+        try:
+            if sf.info(src).samplerate == self.sample_rate:
+                return src, False
+        except Exception:
+            pass
+        from . import media
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="orioncut_rs_")
+        os.close(fd)
+        self.log(f"Привожу к {self.sample_rate} Гц...")
+        media.extract(src, tmp, audio_index=0,
+                      sample_rate=self.sample_rate, log=None)
+        return tmp, True
+
+    def _pick_name(self, out_dir, base, suffix, ext):
+        dst = os.path.join(out_dir, base + suffix + ext)
+        n = 1
+        while os.path.exists(dst):
+            dst = os.path.join(out_dir, f"{base}{suffix}_{n}{ext}")
+            n += 1
+        return dst
+
     def process_file(self, src, out_dir=None, stems="both",
                      fmt="wav32", progress=None, should_stop=None,
                      base=None):
-        """Возвращает список сохранённых файлов.
-        base — имя результата без расширения (по умолчанию из имени src)."""
+        """Обрабатывает файл потоком и возвращает список результатов.
+
+        Читаем, считаем и пишем блоками: расход памяти не зависит от
+        длительности. Раньше весь звук и весь результат держались в
+        памяти целиком, и на двухчасовом фильме это уходило за 20 ГБ.
+        """
+        import soundfile as sf
+
         out_dir = out_dir or os.path.dirname(src)
         os.makedirs(out_dir, exist_ok=True)
         base = base or os.path.splitext(os.path.basename(src))[0]
         ext = ".flac" if fmt == "flac24" else ".wav"
+        subtype = self._SUBTYPE.get(fmt, "FLOAT")
 
-        mix = self.load_audio(src)
-        dur = mix.shape[1] / self.sample_rate
-        self.log(f"Длительность: {dur/60:.1f} мин, обрабатываю...")
+        path, is_tmp = self._ensure_rate(src)
+        saved, writers = [], {}
+        try:
+            with sf.SoundFile(path) as fin:
+                total = len(fin)
+                self.log(f"Длительность: {total / self.sample_rate / 60:.1f}"
+                         f" мин, обрабатываю...")
 
-        res = self.demix(mix, progress=progress, should_stop=should_stop)
-        voc, inst = self.to_two_stems(res, mix)
+                margin = int(self.config.audio["chunk_size"])
+                limit = int(self.BLOCK_SECONDS * self.sample_rate)
+                step = max(limit - 2 * margin, margin)
 
-        saved = []
-        for audio, is_voc in ((inst, False), (voc, True)):
-            if audio is None:
-                continue
-            if stems == "instrumental" and is_voc:
-                continue
-            if stems == "vocals" and not is_voc:
-                continue
-            suffix = "_vocals" if is_voc else "_instrumental"
-            dst = os.path.join(out_dir, base + suffix + ext)
-            n = 1
-            while os.path.exists(dst):
-                dst = os.path.join(out_dir, f"{base}{suffix}_{n}{ext}")
-                n += 1
-            self.save_audio(dst, audio, fmt)
-            saved.append(dst)
-            self.log("Сохранено: " + dst)
+                want = []
+                if stems in ("both", "instrumental"):
+                    want.append(("_instrumental", False))
+                if stems in ("both", "vocals"):
+                    want.append(("_vocals", True))
+                for suffix, is_voc in want:
+                    dst = self._pick_name(out_dir, base, suffix, ext)
+                    writers[is_voc] = sf.SoundFile(
+                        dst, "w", samplerate=self.sample_rate,
+                        channels=2, subtype=subtype)
+                    saved.append(dst)
+
+                pos = 0
+                while pos < total:
+                    if should_stop and should_stop():
+                        raise RenderCancelled()
+                    lo = max(0, pos - margin)
+                    hi = min(total, pos + step + margin)
+                    fin.seek(lo)
+                    block = fin.read(hi - lo, dtype="float32",
+                                     always_2d=True).T
+                    if block.shape[0] == 1:              # моно → стерео
+                        block = np.vstack([block, block])
+                    block = np.ascontiguousarray(block, dtype=np.float32)
+
+                    res = self._demix_block(
+                        block,
+                        progress=lambda d, t, _lo=lo: progress(
+                            min(_lo + d, total), total) if progress else None,
+                        should_stop=should_stop)
+                    voc, inst = self.to_two_stems(res, block)
+
+                    a = pos - lo
+                    b = a + min(step, total - pos)
+                    for is_voc, w in writers.items():
+                        part = voc if is_voc else inst
+                        if part is not None:
+                            w.write(part[..., a:b].T)
+                    pos += step
+                    res = voc = inst = block = None       # освобождаем сразу
+
+            for w in writers.values():
+                w.close()
+            writers.clear()
+            for dst in saved:
+                self.log("Сохранено: " + dst)
+        except BaseException:
+            for w in writers.values():
+                try:
+                    w.close()
+                except Exception:
+                    pass
+            for dst in saved:                 # недописанные файлы не нужны
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if is_tmp and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            # возвращаем кэш видеопамяти системе: между файлами он
+            # держал бы гигабайты, мешая другим программам
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
         return saved
 
     @staticmethod

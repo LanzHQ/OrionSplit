@@ -28,7 +28,7 @@ from ui.dialogs import TrackDialog, SettingsDialog
 
 APP_NAME = "OrionSplit"
 APP_ID = "OrionSplit"
-APP_VERSION = "v3.0"
+APP_VERSION = "v3.1"
 AUTHOR = "Ilya Lavrin"
 
 AUDIO_EXT = (".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus",
@@ -125,6 +125,28 @@ def apply_theme(app):
     check = resource_path(
         os.path.join("assets", ACTIVE["CHECK"])).replace("\\", "/")
     app.setStyleSheet(build_qss(check))
+
+
+def cleanup_stale_temp(max_age_hours=6):
+    """Убирает временные извлечения, оставшиеся от прерванных прогонов.
+
+    Обычно их удаляет сам рендер, но если программу закрыли посреди
+    обработки видео, в Temp остаётся файл на гигабайт-полтора.
+    Свежие не трогаем — их может использовать другая запущенная копия.
+    """
+    import glob
+    cutoff = time.time() - max_age_hours * 3600
+    freed = 0
+    for path in glob.glob(os.path.join(tempfile.gettempdir(),
+                                       "orioncut_*.wav")):
+        try:
+            if os.path.getmtime(path) < cutoff:
+                size = os.path.getsize(path)
+                os.remove(path)
+                freed += size
+        except OSError:
+            pass
+    return freed
 
 
 def cfg_path():
@@ -1375,7 +1397,13 @@ def main():
         app.setWindowIcon(QIcon(ico))
     app.setFont(grotesk(12))
 
+    freed = cleanup_stale_temp()
+
     w = MainWindow()
+    if freed:
+        w.append_log(
+            f"Убраны временные файлы прерванных прогонов "
+            f"({freed / (1 << 30):.1f} ГБ).", "normal")
     w.show()
     sys.exit(app.exec())
 
